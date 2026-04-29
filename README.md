@@ -8,6 +8,10 @@ Runs directly on the server using `tcpdump` — no agents, no dependencies beyon
 ## Features
 
 - **Live traffic table** — refreshes every 0.5 s with per-flow bandwidth rates
+- **Accurate total bandwidth** — reads directly from `/proc/net/dev` (kernel counters), immune to tcpdump packet drops
+- **Sampled flow breakdown** — tcpdump identifies per-flow src/dst/protocol with high-throughput settings (`-B 65536 -s 96`)
+- **IFACE column** — interface shown on every flow row
+- **Auto interface detection** — detects the default route interface on startup; pass an interface name to override
 - **Precise protocol detection** — content-first parsing of tcpdump annotations, falls back to 60+ well-known port mappings
 - **ICMP subtypes** — `PING`, `PONG`, `ICMP-TTL`, `ICMP-UNR`, `ICMP-RDR` …
 - **DNS query types** — `DNS-A`, `DNS-AAAA`, `DNS-MX`, `DNS-PTR`, `DNS-R` …
@@ -39,13 +43,13 @@ cd linux-network-torch
 ## Usage
 
 ```bash
-# monitor default bridge (viifbr0) — shows all VM traffic
+# auto-detect default route interface and start immediately
 python3 torch.py
 
 # monitor a specific interface
 python3 torch.py eth0
-python3 torch.py viifv8305
 python3 torch.py viifbr0
+python3 torch.py viifv8305
 ```
 
 Press **Q** or **ESC** to quit.
@@ -53,17 +57,28 @@ Press **Q** or **ESC** to quit.
 ## Display
 
 ```
- TORCH  iface=viifv8305  2026-04-28 10:22:01  [Q] quit
-SRC IP:PORT               DST IP:PORT               PROTOCOL       RATE          PKTS
-──────────────────────────────────────────────────────────────────────────────────────
-203.0.113.10:443          198.51.100.5:54812         HTTPS          2235.4 KB/s   82,341
-198.51.100.5:51234        203.0.113.20:443            HTTPS          1775.8 KB/s   44,210
-8.8.8.8:53                198.51.100.5:45231          DNS-R           120.3 KB/s    9,800
-198.51.100.5:45231        8.8.8.8:53                  DNS-A            45.1 KB/s    4,200
-198.51.100.5:0            192.0.2.1:0                 PING              0.5 KB/s       12
-──────────────────────────────────────────────────────────────────────────────────────
-  Total:   4.2 MB/s  │  Flows: 28  │  capturing on viifv8305…
+ TORCH  iface=viifbr0  2026-04-29 11:42:05  [Q] quit
+IFACE           SRC IP:PORT               DST IP:PORT               PROTOCOL       RATE          PKTS
+──────────────────────────────────────────────────────────────────────────────────────────────────────
+viifbr0         203.0.113.10:443          198.51.100.5:54812        HTTPS           2.18 MB/s   82,341
+viifbr0         198.51.100.5:51234        203.0.113.20:443          HTTPS           1.74 MB/s   44,210
+viifbr0         8.8.8.8:53               198.51.100.5:45231         DNS-R         120.3 KB/s    9,800
+viifbr0         198.51.100.5:45231       8.8.8.8:53                 DNS-A          45.1 KB/s    4,200
+viifbr0         198.51.100.5:0           192.0.2.1:0                PING            0.5 KB/s       12
+──────────────────────────────────────────────────────────────────────────────────────────────────────
+  Actual: 193.45 MB/s  │  Sampled: 87.20 MB/s  │  sampled 45%  │  Flows: 28  │  capturing on viifbr0…
 ```
+
+### Footer explained
+
+| Field | Source | Description |
+|-------|--------|-------------|
+| **Actual** | `/proc/net/dev` | True wire bandwidth — always accurate, never drops |
+| **Sampled** | tcpdump | Bandwidth visible to the flow table |
+| **sampled %** | ratio | How much of the traffic tcpdump managed to capture |
+| **Flows** | tcpdump | Number of active flows in the table |
+
+> On high-traffic bridge interfaces (100+ Mbit/s with thousands of flows), tcpdump may sample only a fraction of packets. The **Actual** figure always reflects real throughput.
 
 ## Protocol Color Codes
 

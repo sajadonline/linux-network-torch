@@ -2,14 +2,13 @@
 """
 Torch — MikroTik-style real-time traffic monitor for Linux servers
 Usage:
-    python3 torch.py              # monitors default bridge (viifbr0)
+    python3 torch.py              # monitors interface of the default route
     python3 torch.py viifv8305    # monitors specific interface
 Keys: Q / ESC = quit
 """
 
 import sys, re, time, curses, threading, subprocess
 
-BRIDGE   = "viifbr0"
 REFRESH  = 1.0    # rate recalculation interval (seconds)
 FLOW_TTL = 30     # seconds before idle flow is removed
 TOP_N    = 100    # max flows to keep in display
@@ -62,12 +61,42 @@ PORT_MAP = {
   4000: "App",   5000: "App",   7000: "App",
 }
 
+def get_default_iface():
+    """Return the interface used by the default route (e.g. eth0, viifbr0)."""
+    try:
+        out = subprocess.check_output(
+            ["ip", "route", "show", "default"], text=True, stderr=subprocess.DEVNULL
+        )
+        for line in out.splitlines():
+            m = re.search(r'\bdev\s+(\S+)', line)
+            if m:
+                return m.group(1)
+    except Exception:
+        pass
+    raise SystemExit("Cannot determine default interface — pass one explicitly: torch.py <iface>")
+
+
+
 # ── Shared state ───────────────────────────────────────────────────────────────
 # flows[key] = [bytes_total, bytes_snap, rate_bps, packets, last_seen_monotonic]
 flows      = {}
 flows_lock = threading.Lock()
 stop_event = threading.Event()
 status_msg = "starting…"
+true_bps   = 0.0   # accurate rate from /proc/net/dev
+
+
+def read_iface_bytes(iface):
+    """Return (rx_bytes, tx_bytes) from /proc/net/dev, or (0,0) on error."""
+    try:
+        with open("/proc/net/dev") as f:
+            for line in f:
+                if line.strip().startswith(iface + ":"):
+                    fields = line.split()
+                    return int(fields[1]), int(fields[9])
+    except Exception:
+        pass
+    return 0, 0
 
 
 # ── Protocol detection ─────────────────────────────────────────────────────────
@@ -203,6 +232,16 @@ def parse_tcpdump_line(line):
     m_len = re.search(r'length (\d+)', rest)
     length = int(m_len.group(1)) if m_len else 64
 
+    # tcpdump reports payload only; add L2/L3/L4 headers for wire-accurate bytes
+    # ARP: tcpdump already reports full frame length — no adjustment needed
+    if proto != 'ARP':
+        if 'Flags' in rest:      # TCP: +14 eth +20 ip +20 tcp
+            length += 54
+        elif 'UDP' in rest[:10]: # UDP: +14 eth +20 ip +8 udp
+            length += 42
+        else:                    # ICMP / other IP: +14 eth +20 ip
+            length += 34
+
     return src_ip, src_port, dst_ip, dst_port, proto, length
 
 
@@ -211,7 +250,7 @@ def parse_tcpdump_line(line):
 def run_tcpdump(iface):
     global status_msg
     status_msg = f"capturing on {iface}…"
-    cmd = ["tcpdump", "-i", iface, "-nn", "-l"]
+    cmd = ["tcpdump", "-i", iface, "-nn", "-l", "-B", "65536", "-s", "96"]
     proc = subprocess.Popen(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
         text=True, bufsize=1
@@ -246,9 +285,14 @@ def capture_worker(iface):
             f[4] = now
 
 
-def rate_worker():
+def rate_worker(iface):
+    global true_bps
+    prev_rx, prev_tx = read_iface_bytes(iface)
     while not stop_event.wait(REFRESH):
         now = time.monotonic()
+        rx, tx = read_iface_bytes(iface)
+        true_bps = (rx - prev_rx + tx - prev_tx) / REFRESH
+        prev_rx, prev_tx = rx, tx
         with flows_lock:
             stale = []
             for key, f in flows.items():
@@ -318,7 +362,7 @@ def draw_ui(stdscr, iface):
         stdscr.attroff(curses.color_pair(1) | curses.A_BOLD)
 
         # Column headers
-        col_hdr = f"{'SRC IP:PORT':<24}  {'DST IP:PORT':<24}  {'PROTOCOL':<12}  {'RATE':>14}  {'PKTS':>10}"
+        col_hdr = f"{'IFACE':<12}  {'SRC IP:PORT':<24}  {'DST IP:PORT':<24}  {'PROTOCOL':<12}  {'RATE':>14}  {'PKTS':>10}"
         stdscr.attron(curses.color_pair(2) | curses.A_BOLD)
         stdscr.addstr(1, 0, col_hdr[:w - 1])
         stdscr.attroff(curses.color_pair(2) | curses.A_BOLD)
@@ -338,7 +382,7 @@ def draw_ui(stdscr, iface):
             src_col = f"{src}:{sport}" if sport else src
             dst_col = f"{dst}:{dport}" if dport else dst
             cp   = curses.color_pair(proto_color(proto))
-            line = f"{src_col:<24}  {dst_col:<24}  {proto:<12}  {fmt_rate(bps):>14}  {pkts:>10,}"
+            line = f"{iface:<12}  {src_col:<24}  {dst_col:<24}  {proto:<12}  {fmt_rate(bps):>14}  {pkts:>10,}"
             stdscr.attron(cp)
             try:
                 stdscr.addstr(row, 0, line[:w - 1])
@@ -348,8 +392,13 @@ def draw_ui(stdscr, iface):
             row += 1
 
         # Footer
+        drop_pct = ""
+        if true_bps > 0 and total_bps > 0:
+            pct = min(total_bps / true_bps * 100, 100)
+            drop_pct = f"  │  sampled {pct:.0f}%"
         foot = (
-            f"  Total: {fmt_rate(total_bps)}  │  "
+            f"  Actual: {fmt_rate(true_bps)}  │  "
+            f"Sampled: {fmt_rate(total_bps)}{drop_pct}  │  "
             f"Flows: {len(snapshot)}  │  {status_msg}  "
         )
         stdscr.attron(curses.color_pair(1))
@@ -364,10 +413,10 @@ def draw_ui(stdscr, iface):
 
 
 def main():
-    iface = sys.argv[1] if len(sys.argv) > 1 else BRIDGE
+    iface = sys.argv[1] if len(sys.argv) > 1 else get_default_iface()
 
     t_cap  = threading.Thread(target=capture_worker, args=(iface,), daemon=True)
-    t_rate = threading.Thread(target=rate_worker,    daemon=True)
+    t_rate = threading.Thread(target=rate_worker,    args=(iface,), daemon=True)
     t_cap.start()
     t_rate.start()
 
